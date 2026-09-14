@@ -24,4 +24,5 @@ Usage:
 from task1_common import run_one_scenario
 
 if __name__ == "__main__":
-    run_one_scenario("network_partition_minority_isolated")
+    #run_one_scenario("network_partition_minority_isolated")
+    run_one_scenario("network_partition_minority_isolated",pin_reads=False)

@@ -694,22 +694,58 @@ SCENARIO_NAMES = (
 )
 
 
-def run_one_scenario(scenario_name):
+def run_one_scenario(scenario_name, pin_reads=True):
     """
     Run Task 1 (Config A vs Config B, write-then-read) under exactly ONE
     named scenario, then clean up and return that scenario's result dict
     (or None if the scenario had to be skipped - e.g. no secondary
     currently discoverable to fail/isolate).
 
-    This is the single entry point each of the four
-    task1_scenario_*.py launcher scripts calls. Splitting scenarios into
-    separate script invocations means:
+    This is the single entry point each of the task1_scenario_*.py
+    launcher scripts calls. Splitting scenarios into separate script
+    invocations means:
       - you only have to babysit ONE manual stop/start or
         network-partition step per run, instead of four in a row;
       - a mistake, Ctrl-C, or crash during one scenario's manual step
         doesn't discard the results already collected for the others -
         each scenario writes its own timestamped JSONL log file (see
         common.TrialLogger) and prints its own full Config A/B report.
+
+    pin_reads (default True):
+        True  - Config A/B reads are pinned to the EXACT node
+                secondary_failure/partition is about to fail/isolate (via
+                a custom server_selector - see common.get_pinned_client).
+                This is what every task1_scenario_*.py script has used so
+                far: it guarantees the experiment actually exercises reads
+                against the node under test, rather than letting the
+                driver's own server selection (SDAM) quietly drift onto a
+                healthy node and hide the fault entirely. The trade-off:
+                once that pinned node is fully down, EVERY read fails with
+                ServerSelectionTimeoutError - Config A and Config B both
+                collapse to 100% availability loss / 0 effective
+                iterations, so this mode cannot show whether RYW holds on
+                a SURVIVING node while another one is down.
+
+        False - Config A/B use a completely UNPINNED client. Read
+                selection is left entirely to the driver's own SDAM
+                heuristics, exactly like a normal production client would
+                behave. When the node currently serving reads is the one
+                that secondary_failure/partition takes down, the driver's
+                heartbeat mechanism (~10s interval, or immediate on a
+                failed op) marks it unavailable and later reads should
+                automatically move to a surviving secondary instead of
+                failing outright. This answers a different, complementary
+                question from the pinned mode: "once the driver has
+                failed over to a healthy secondary, does RYW still hold
+                there (or does the churn from the fresh failover make
+                Config A even more likely to serve a stale read)?" - at
+                the cost of NOT guaranteeing every read actually hit the
+                failing node while it was still reachable (some early
+                reads, right after the fault is injected but before SDAM's
+                heartbeat notices, may still land on the dying node and
+                show up as availability losses too - that's expected and
+                is exactly the failover transition being observed, not a
+                bug).
 
     Before calling this for `secondary_failure`, `primary_failure`, or
     `network_partition_minority_isolated`, make sure the replica set is
@@ -724,42 +760,69 @@ def run_one_scenario(scenario_name):
 
     client = common.get_client()
 
-    _section(f"TASK 1: READ-YOUR-WRITES - SCENARIO '{scenario_name}'")
+    mode_suffix = "" if pin_reads else "_unpinned"
+    mode_label = "PINNED to the exact failing/isolated node" if pin_reads \
+        else "UNPINNED - driver's own SDAM server selection decides"
+
+    _section(f"TASK 1: READ-YOUR-WRITES - SCENARIO '{scenario_name}' "
+             f"({'pinned' if pin_reads else 'unpinned'} reads)")
     print(f"Run started at: {_now()}")
+    print(f"Read targeting : {mode_label}")
     print("Cluster topology and starting replication lag:")
     common.print_topology(client)
     common.print_replication_lag(client)
 
     db = client[common.DB_NAME]
-    logger = common.TrialLogger(f"task1_ryw_{scenario_name}")
+    logger = common.TrialLogger(f"task1_ryw_{scenario_name}{mode_suffix}")
     all_run_ids = []
 
     def run_experiment(scenario_label="unknown", target_node=None):
-        # Pin Config A/B reads to a specific node, so "secondary_failure" and
-        # "network_partition_minority_isolated" actually exercise reads
-        # against the node under test instead of leaving node selection to
-        # the driver's SDAM heuristics (which would happily drift onto
-        # whichever secondary is still healthy).
-        #
-        # When scenarios.py hands us `target_node`, it is the exact
-        # "host:port" it decided on BEFORE injecting the fault - use it
-        # as-is. Only fall back to a fresh discovery (`_discover_pin_target`)
-        # when no specific node is under test ("normal", "primary_failure"):
-        # re-discovering during secondary_failure/partition would find the
-        # failed/isolated node already missing from the topology and
-        # silently pin to the surviving node instead.
-        if target_node is not None:
-            pinned_target = _parse_node_str(target_node)
-        else:
-            pinned_target = _discover_pin_target(client)
-        if pinned_target is None:
-            print("[pin] WARNING: no secondary currently discoverable; falling back "
-                  "to an un-pinned client for this scenario (less reproducible).")
+        if not pin_reads:
+            # Deliberately skip pinning: use the plain, un-pinned `client`
+            # so Config A/B's readPreference=SECONDARY is resolved by the
+            # driver's normal SDAM logic on every single read. If the node
+            # currently answering reads is the one about to be stopped/
+            # isolated, subsequent reads should automatically fail over to
+            # whichever secondary is still healthy - that failover
+            # behavior, and whatever it does to RYW during the transition,
+            # is exactly what this mode is measuring.
+            pinned_target = None
             pinned_client = client
+            print(f"[pin] pin_reads=False for scenario '{scenario_label}': "
+                  f"reads are UNPINNED. The driver's own server selection "
+                  f"(SDAM) will choose which secondary answers each read, "
+                  f"and should move off a node once its heartbeat marks "
+                  f"that node unavailable - that's the transition this run "
+                  f"is meant to observe.")
         else:
-            print(f"[pin] pinning Config A/B secondary reads to "
-                  f"{_fmt_addr(pinned_target)} for scenario '{scenario_label}'")
-            pinned_client = common.get_pinned_client(pinned_target)
+            # Pin Config A/B reads to a specific node, so "secondary_failure"
+            # and "network_partition_minority_isolated" actually exercise
+            # reads against the node under test instead of leaving node
+            # selection to the driver's SDAM heuristics (which would happily
+            # drift onto whichever secondary is still healthy).
+            #
+            # When scenarios.py hands us `target_node`, it is the exact
+            # "host:port" it decided on BEFORE injecting the fault - use it
+            # as-is. Only fall back to a fresh discovery
+            # (`_discover_pin_target`) when no specific node is under test
+            # ("normal", "primary_failure"): re-discovering during
+            # secondary_failure/partition would find the failed/isolated
+            # node already missing from the topology and silently pin to
+            # the surviving node instead.
+            if target_node is not None:
+                pinned_target = _parse_node_str(target_node)
+            else:
+                pinned_target = _discover_pin_target(client)
+            if pinned_target is None:
+                print("[pin] WARNING: no secondary currently discoverable; "
+                      "falling back to an un-pinned client for this "
+                      "scenario (less reproducible).")
+                pinned_client = client
+            else:
+                print(f"[pin] pinning Config A/B secondary reads to "
+                      f"{_fmt_addr(pinned_target)} for scenario "
+                      f"'{scenario_label}'")
+                pinned_client = common.get_pinned_client(pinned_target)
 
         pinned_db = pinned_client[common.DB_NAME]
 
