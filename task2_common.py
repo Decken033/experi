@@ -1,8 +1,31 @@
 #!/usr/bin/env python3
 """
-task2_monotonic_reads.py
+task2_common.py
 
-Client-centric consistency model: MONOTONIC READS (MR).
+Shared library for Task 2: client-centric consistency model
+MONOTONIC READS (MR).
+
+This module holds everything that does NOT depend on which scenario is
+being run: Config A / Config B implementations, the Writer thread, the
+replication-lag injectors, comparison/summary printers, and
+`run_one_scenario(scenario_name)` - the single entry point each of the
+four `task2_scenario_*.py` launcher scripts calls to run Task 2 under
+exactly one named scenario ("normal", "secondary_failure",
+"primary_failure", "network_partition_minority_isolated").
+
+Run one of the launcher scripts directly, e.g.:
+    python task2_scenario_normal.py
+    python task2_scenario_secondary_failure.py
+    python task2_scenario_primary_failure.py
+    python task2_scenario_partition.py
+
+Splitting the four scenarios into separate script invocations (instead of
+one script that loops through all four, as the original
+task2_monotonic_reads.py did) mirrors task1_common.py: you only have to
+babysit ONE manual docker-stop/start or network-partition step per run,
+and a mistake, Ctrl-C, or crash during one scenario's manual step doesn't
+discard the results already collected for the others - each scenario
+writes its own timestamped JSONL log file (see common.TrialLogger).
 
 Definition
 ----------
@@ -648,32 +671,32 @@ def run_config_a(client, db, doc_id, lag_secondary=None, normal_secondary=None,
         print("[read] driver-selected read loop finished")
 
     if lag_secondary is not None and normal_secondary is not None:
-        with make_lag_injector(client, lag_secondary):
-            # Give the lagging node time to reach steady-state lag before we
-            # start reading, so every read during the loop sees a real gap.
-            print(f"[lag] warming up for {LAG_WARMUP_SECS}s so lag reaches steady state...")
-            time.sleep(LAG_WARMUP_SECS)
+        # NOTE: unlike earlier revisions, run_config_a no longer opens/closes
+        # its own DelayedSecondaryInjector/FailpointLagInjector here. The lag
+        # on `lag_secondary` is expected to ALREADY be active and warmed up
+        # by the caller (run_one_scenario's run_experiment), which keeps it
+        # open across BOTH run_config_a and run_config_b. Opening/closing it
+        # inside run_config_a alone meant the lag was reverted as soon as
+        # Config A finished, so Config B ran against a fully-caught-up
+        # cluster - the two configs were not actually being compared under
+        # the same replication condition.
+        client_normal = _make_direct_secondary_client(normal_secondary)
+        client_lagged = _make_direct_secondary_client(lag_secondary)
 
-            print("Lag after injection (lagging node should be > 0):")
-            common.print_replication_lag(db.client)
-
-            client_normal = _make_direct_secondary_client(normal_secondary)
-            client_lagged = _make_direct_secondary_client(lag_secondary)
-
-            try:
-                coll_normal = client_normal[common.DB_NAME].get_collection(
-                    COLLECTION_NAME,
-                    read_concern=ReadConcern("local"),
-                )
-                coll_lagged = client_lagged[common.DB_NAME].get_collection(
-                    COLLECTION_NAME,
-                    read_concern=ReadConcern("local"),
-                )
-                read_loop_alternating(coll_normal, coll_lagged)
-            finally:
-                print("[setup] closing direct secondary connections")
-                client_normal.close()
-                client_lagged.close()
+        try:
+            coll_normal = client_normal[common.DB_NAME].get_collection(
+                COLLECTION_NAME,
+                read_concern=ReadConcern("local"),
+            )
+            coll_lagged = client_lagged[common.DB_NAME].get_collection(
+                COLLECTION_NAME,
+                read_concern=ReadConcern("local"),
+            )
+            read_loop_alternating(coll_normal, coll_lagged)
+        finally:
+            print("[setup] closing direct secondary connections")
+            client_normal.close()
+            client_lagged.close()
     else:
         coll = db.get_collection(
             COLLECTION_NAME,
@@ -729,7 +752,8 @@ def run_config_a(client, db, doc_id, lag_secondary=None, normal_secondary=None,
 # Config B
 # ------------------------------------------------------------
 
-def run_config_b(client, db, doc_id, logger=None, scenario_label="unknown"):
+def run_config_b(client, db, doc_id, lag_secondary=None, normal_secondary=None,
+                  logger=None, scenario_label="unknown"):
     """
     Config B:
 
@@ -737,11 +761,42 @@ def run_config_b(client, db, doc_id, logger=None, scenario_label="unknown"):
         readPreference = secondary
         causal_consistency = True
 
-    The same session is used for all reads.
-
     The causal session carries causal ordering information forward between
     operations so the client should not observe a version older than one
     already observed during that session.
+
+    lag_secondary, normal_secondary : (host, port) or None
+        When both are given (same pair Config A alternates between - see
+        run_one_scenario, which keeps the lag on `lag_secondary` ACTIVE
+        across both run_config_a and run_config_b), reads explicitly
+        alternate between two directConnection clients - one per secondary -
+        instead of letting the driver's own SDAM choose a secondary.
+
+        This matters because a plain readPreference=SECONDARY session would,
+        in a ~2s read loop (READS=400 at READ_INTERVAL=0.005s), almost
+        certainly stick to whichever secondary the driver picked first
+        (likely the fresh, low-latency one) and never actually touch the
+        lagging node at all - exactly the SDAM-scheduling problem documented
+        for Config A. That would make "Config B upheld MR" a hollow result:
+        it wouldn't have been tested against the lag in the first place.
+
+        A single pymongo ClientSession cannot be reused across two different
+        MongoClient instances directly, so causal ordering is carried
+        forward manually between the two per-connection sessions via the
+        documented cross-client causal-consistency pattern:
+        ClientSession.advance_cluster_time()/advance_operation_time(). This
+        keeps every read causally ordered after the previous one even though
+        consecutive reads land on two different physical connections/
+        sessions - so if the causal session guarantee holds, the lagging
+        secondary must either wait until it has caught up to the last
+        observed point before answering, or the read times out
+        (availability_loss) - it must never simply return its own
+        (older) view.
+
+        When either is missing (no artificial lag in play - e.g. during the
+        secondary_failure/primary_failure/network_partition scenarios, or if
+        fewer than two secondaries are available), falls back to a single
+        causal session against a driver-selected secondary, as before.
     """
 
     print("=" * 60)
@@ -751,95 +806,176 @@ def run_config_b(client, db, doc_id, logger=None, scenario_label="unknown"):
     print("readPreference=secondary")
     print("causal_consistency=True")
     print(f"doc_id        = {doc_id!r}")
+    if lag_secondary is not None and normal_secondary is not None:
+        print(
+            f"read pattern  : explicitly alternating between "
+            f"{normal_secondary[0]}:{normal_secondary[1]} (fresh) and "
+            f"{lag_secondary[0]}:{lag_secondary[1]} (lagging); causal token "
+            f"carried across both connections via "
+            f"advance_cluster_time/advance_operation_time"
+        )
+    else:
+        print("read pattern  : driver-selected secondary (SDAM default), single causal session")
     print("=" * 60)
-
-    coll = db.get_collection(
-        COLLECTION_NAME,
-        read_preference=ReadPreference.SECONDARY,
-        read_concern=ReadConcern("majority"),
-    )
 
     highest_seen = -1
     counters = {"violations": 0, "availability_losses": 0, "errors": 0}
     successful_reads = 0
     served_by = Counter()
 
-    print(f"[read] starting causal-session read loop ({READS} reads)...")
+    def _handle_doc(i, doc, address):
+        nonlocal highest_seen, successful_reads
 
-    with client.start_session(
-        causal_consistency=True
-    ) as session:
+        if address is not None:
+            served_by[address] += 1
 
-        for i in range(READS):
-            try:
-                cursor = (
-                    coll.find({"_id": doc_id}, session=session)
-                    .limit(1)
-                    .max_time_ms(10000)
-                )
-                doc = next(cursor, None)
-                address = cursor.address
-            except mongo_errors.PyMongoError as exc:
-                # A timeout/unreachable-node error here means the selected
-                # secondary could not be reached or could not catch up to
-                # the causal read point in time - an availability outcome
-                # (expected during a node-failure/partition scenario), not a
-                # wrong-answer consistency violation.
-                kind = _classify_and_count(exc, counters)
-                tag = "AVAILABILITY" if kind == "availability_loss" else "ERROR"
-                print(f"[{tag}] read #{i + 1} raised {type(exc).__name__}: {exc}")
-                if logger:
-                    logger.log(task="task2_mr", scenario=scenario_label, config="B",
-                                doc_id=doc_id, i=i, outcome=kind)
-                time.sleep(READ_INTERVAL)
-                continue
-
-            if address is not None:
-                served_by[address] += 1
-
-            if not doc or "seq" not in doc:
-                if VERBOSE_EVERY_READ:
-                    print(f"    [read {i + 1:>4}] from={_fmt_addr(address):<20} doc not found yet")
-                _print_progress(i, READS, highest_seen, address, counters["violations"])
-                if logger:
-                    logger.log(task="task2_mr", scenario=scenario_label, config="B",
-                                doc_id=doc_id, i=i, served_by=_fmt_addr(address),
-                                outcome="not_found")
-                time.sleep(READ_INTERVAL)
-                continue
-
-            successful_reads += 1
-
-            seq = doc["seq"]
-            is_violation = seq < highest_seen
-
+        if not doc or "seq" not in doc:
             if VERBOSE_EVERY_READ:
-                marker = " <-- VIOLATION" if is_violation else ""
-                print(
-                    f"    [read {i + 1:>4}] from={_fmt_addr(address):<20} "
-                    f"seq={seq}{marker}"
-                )
-
-            if is_violation:
-                counters["violations"] += 1
-                print(
-                    f"[MR VIOLATION] read #{i + 1}: "
-                    f"saw seq={seq} after previously seeing {highest_seen} "
-                    f"(served by {_fmt_addr(address)})"
-                )
-
+                print(f"    [read {i + 1:>4}] from={_fmt_addr(address):<20} doc not found yet")
+            _print_progress(i, READS, highest_seen, address, counters["violations"])
             if logger:
                 logger.log(task="task2_mr", scenario=scenario_label, config="B",
                             doc_id=doc_id, i=i, served_by=_fmt_addr(address),
-                            seq=seq, highest_before=highest_seen,
-                            outcome="violation" if is_violation else "ok")
+                            outcome="not_found")
+            return
 
-            highest_seen = max(highest_seen, seq)
-            _print_progress(i, READS, seq, address, counters["violations"])
+        successful_reads += 1
+        seq = doc["seq"]
+        is_violation = seq < highest_seen
 
-            time.sleep(READ_INTERVAL)
+        if VERBOSE_EVERY_READ:
+            marker = " <-- VIOLATION" if is_violation else ""
+            print(
+                f"    [read {i + 1:>4}] from={_fmt_addr(address):<20} "
+                f"seq={seq}{marker}"
+            )
 
-    print("[read] causal-session read loop finished")
+        if is_violation:
+            counters["violations"] += 1
+            print(
+                f"[MR VIOLATION] read #{i + 1}: "
+                f"saw seq={seq} after previously seeing {highest_seen} "
+                f"(served by {_fmt_addr(address)})"
+            )
+
+        if logger:
+            logger.log(task="task2_mr", scenario=scenario_label, config="B",
+                        doc_id=doc_id, i=i, served_by=_fmt_addr(address),
+                        seq=seq, highest_before=highest_seen,
+                        outcome="violation" if is_violation else "ok")
+
+        highest_seen = max(highest_seen, seq)
+        _print_progress(i, READS, seq, address, counters["violations"])
+
+    def _read_error(i, address, exc):
+        kind = _classify_and_count(exc, counters)
+        tag = "AVAILABILITY" if kind == "availability_loss" else "ERROR"
+        print(f"[{tag}] read #{i + 1} from={_fmt_addr(address):<20} "
+              f"raised {type(exc).__name__}: {exc}")
+        if logger:
+            logger.log(task="task2_mr", scenario=scenario_label, config="B",
+                        doc_id=doc_id, i=i, served_by=_fmt_addr(address),
+                        outcome=kind)
+
+    if lag_secondary is not None and normal_secondary is not None:
+        print(f"[read] starting alternating causal read loop ({READS} reads)...")
+
+        client_normal = _make_direct_secondary_client(normal_secondary)
+        client_lagged = _make_direct_secondary_client(lag_secondary)
+
+        try:
+            coll_normal = client_normal[common.DB_NAME].get_collection(
+                COLLECTION_NAME, read_concern=ReadConcern("majority"),
+            )
+            coll_lagged = client_lagged[common.DB_NAME].get_collection(
+                COLLECTION_NAME, read_concern=ReadConcern("majority"),
+            )
+
+            session_normal = client_normal.start_session(causal_consistency=True)
+            session_lagged = client_lagged.start_session(causal_consistency=True)
+
+            try:
+                for i in range(READS):
+                    use_lagged = (i % 2 == 1)
+                    coll = coll_lagged if use_lagged else coll_normal
+                    session = session_lagged if use_lagged else session_normal
+                    other_session = session_normal if use_lagged else session_lagged
+                    address = lag_secondary if use_lagged else normal_secondary
+
+                    # Carry the causal token forward from whichever session
+                    # performed the PREVIOUS read into the session we are
+                    # about to use, so this read is causally ordered after
+                    # every prior read this (logical) client has observed -
+                    # even though it is a physically different
+                    # MongoClient/ClientSession. This is pymongo's documented
+                    # pattern for causal consistency across multiple clients.
+                    if other_session.cluster_time is not None:
+                        session.advance_cluster_time(other_session.cluster_time)
+                    if other_session.operation_time is not None:
+                        session.advance_operation_time(other_session.operation_time)
+
+                    try:
+                        cursor = (
+                            coll.find({"_id": doc_id}, session=session)
+                            .limit(1)
+                            .max_time_ms(15000)
+                        )
+                        doc = next(cursor, None)
+                    except mongo_errors.PyMongoError as exc:
+                        # Expected on the lagging half of the alternation:
+                        # the lagging secondary cannot satisfy the causal
+                        # read point (it is ~DELAY_SECS behind) within
+                        # max_time_ms - an availability outcome, not a
+                        # wrong-answer consistency violation.
+                        _read_error(i, address, exc)
+                        time.sleep(READ_INTERVAL)
+                        continue
+
+                    _handle_doc(i, doc, address)
+                    time.sleep(READ_INTERVAL)
+            finally:
+                session_normal.end_session()
+                session_lagged.end_session()
+        finally:
+            print("[setup] closing direct secondary connections")
+            client_normal.close()
+            client_lagged.close()
+
+        print("[read] alternating causal read loop finished")
+    else:
+        coll = db.get_collection(
+            COLLECTION_NAME,
+            read_preference=ReadPreference.SECONDARY,
+            read_concern=ReadConcern("majority"),
+        )
+
+        print(f"[read] starting causal-session read loop ({READS} reads)...")
+
+        with client.start_session(causal_consistency=True) as session:
+            for i in range(READS):
+                try:
+                    cursor = (
+                        coll.find({"_id": doc_id}, session=session)
+                        .limit(1)
+                        .max_time_ms(10000)
+                    )
+                    doc = next(cursor, None)
+                    address = cursor.address
+                except mongo_errors.PyMongoError as exc:
+                    # A timeout/unreachable-node error here means the
+                    # selected secondary could not be reached or could not
+                    # catch up to the causal read point in time - an
+                    # availability outcome (expected during a node-failure/
+                    # partition scenario), not a wrong-answer consistency
+                    # violation.
+                    _read_error(i, None, exc)
+                    time.sleep(READ_INTERVAL)
+                    continue
+
+                _handle_doc(i, doc, address)
+                time.sleep(READ_INTERVAL)
+
+        print("[read] causal-session read loop finished")
 
     effective = READS - counters["availability_losses"] - counters["errors"]
     print()
@@ -921,7 +1057,7 @@ def run_with_writer(db, doc_id, read_function):
 
 
 # ------------------------------------------------------------
-# Main
+# Comparisons / summaries
 # ------------------------------------------------------------
 
 def _fmt_result(name, res):
@@ -978,6 +1114,12 @@ def print_config_comparison(result_a, result_b):
 
 
 def print_scenario_summary(scenario_results):
+    """
+    Cross-scenario summary (kept for reference / for anyone who wants to
+    re-assemble results collected from separate single-scenario runs into
+    one table). Not called by run_one_scenario() itself, since a single
+    invocation only ever produces one scenario's result.
+    """
     print()
     print("#" * 60)
     print("# CROSS-SCENARIO SUMMARY (Task 2: Monotonic Reads)")
@@ -997,15 +1139,55 @@ def print_scenario_summary(scenario_results):
     print()
 
 
-def main():
+# --------------------------------------------------------------------------
+# Main entry point
+# --------------------------------------------------------------------------
+
+# Valid scenario names, in the order requirements.md expects them to be
+# discussed. Each has a matching function in scenarios.SCENARIO_RUNNERS.
+SCENARIO_NAMES = (
+    "normal",
+    "secondary_failure",
+    "primary_failure",
+    "network_partition_minority_isolated",
+)
+
+
+def run_one_scenario(scenario_name):
+    """
+    Run Task 2 (Config A vs Config B, writer + monotonic-read loop) under
+    exactly ONE named scenario, then clean up and return that scenario's
+    result dict (or None if the scenario had to be skipped - e.g. no
+    secondary currently discoverable to fail/isolate).
+
+    This is the single entry point each of the task2_scenario_*.py
+    launcher scripts calls, mirroring task1_common.run_one_scenario().
+    Splitting scenarios into separate script invocations means:
+      - you only have to babysit ONE manual stop/start or
+        network-partition step per run, instead of four in a row;
+      - a mistake, Ctrl-C, or crash during one scenario's manual step
+        doesn't discard the results already collected for the others -
+        each scenario writes its own timestamped JSONL log file (see
+        common.TrialLogger) and prints its own full Config A/B report.
+
+    Before calling this for `secondary_failure`, `primary_failure`, or
+    `network_partition_minority_isolated`, make sure the replica set is
+    currently healthy (all three nodes up, no lingering partition from a
+    previous run) - each scenario assumes it's starting from a normal
+    topology so it can correctly identify which node to fail/isolate.
+    """
+    if scenario_name not in SCENARIO_NAMES:
+        raise ValueError(
+            f"unknown scenario {scenario_name!r}; expected one of {SCENARIO_NAMES}"
+        )
+
     print("#" * 60)
-    print("# TASK 2: MONOTONIC READS EXPERIMENT")
+    print(f"# TASK 2: MONOTONIC READS - SCENARIO '{scenario_name}'")
     print("#" * 60)
     print()
 
     client = common.get_client()
 
-    # Display replica-set topology and lag before running the experiment.
     print(">>> Replica set topology before experiment:")
     common.print_topology(client)
     print(">>> Replication lag before experiment:")
@@ -1013,7 +1195,7 @@ def main():
     print()
 
     db = client[common.DB_NAME]
-    logger = common.TrialLogger("task2_mr")
+    logger = common.TrialLogger(f"task2_mr_{scenario_name}")
     all_doc_ids = []
 
     def run_experiment(scenario_label="unknown"):
@@ -1073,44 +1255,69 @@ def main():
         doc_id_b = f"{run_id}-config-b-counter"
         all_doc_ids.extend([doc_id_a, doc_id_b])
 
-        print(">>> Running Config A (weak: readConcern=local, no causal session)...\n")
-        result_a = run_with_writer(
-            db,
-            doc_id_a,
-            lambda: run_config_a(
-                client,
+        def _run_both_configs():
+            print(">>> Running Config A (weak: readConcern=local, no causal session)...\n")
+            res_a = run_with_writer(
                 db,
                 doc_id_a,
-                lag_secondary=lag_secondary,
-                normal_secondary=normal_secondary,
-                logger=logger,
-                scenario_label=scenario_label,
-            ),
-        )
+                lambda: run_config_a(
+                    client,
+                    db,
+                    doc_id_a,
+                    lag_secondary=lag_secondary,
+                    normal_secondary=normal_secondary,
+                    logger=logger,
+                    scenario_label=scenario_label,
+                ),
+            )
 
-        print("\n>>> Running Config B (strong: readConcern=majority, causal session)...\n")
-        result_b = run_with_writer(
-            db,
-            doc_id_b,
-            lambda: run_config_b(
-                client,
+            print("\n>>> Running Config B (strong: readConcern=majority, causal session)...\n")
+            res_b = run_with_writer(
                 db,
                 doc_id_b,
-                logger=logger,
-                scenario_label=scenario_label,
-            ),
-        )
+                lambda: run_config_b(
+                    client,
+                    db,
+                    doc_id_b,
+                    lag_secondary=lag_secondary,
+                    normal_secondary=normal_secondary,
+                    logger=logger,
+                    scenario_label=scenario_label,
+                ),
+            )
+            return res_a, res_b
+
+        if lag_secondary is not None and normal_secondary is not None:
+            # Keep the injected lag ACTIVE across BOTH Config A and Config B,
+            # so the two configurations are tested under the EXACT SAME
+            # replication condition. Previously the lag injector was opened
+            # and closed inside run_config_a alone, so by the time Config B
+            # ran the target secondary had already been reverted to normal -
+            # "Config A saw an 8s lag, Config B saw none" made the two
+            # results incomparable.
+            with make_lag_injector(client, lag_secondary):
+                # Give the lagging node time to reach steady-state lag
+                # before either config starts reading.
+                print(f"[lag] warming up for {LAG_WARMUP_SECS}s so lag reaches steady state...")
+                time.sleep(LAG_WARMUP_SECS)
+
+                print("Lag after injection (lagging node should be > 0):")
+                common.print_replication_lag(client)
+
+                result_a, result_b = _run_both_configs()
+        else:
+            result_a, result_b = _run_both_configs()
 
         print_config_comparison(result_a, result_b)
         return {"config_a": result_a, "config_b": result_b}
 
+    result = None
     try:
-        # Requirements.md asks for experiments under several scenarios:
-        # normal operation, node failure, and a network partition.
-        scenario_results = scenarios.run_under_scenarios(
-            client, run_experiment, logger=logger
-        )
-        print_scenario_summary(scenario_results)
+        runner = scenarios.SCENARIO_RUNNERS[scenario_name]
+        result = runner(client, run_experiment, logger=logger)
+        if result is None:
+            print(f"[scenario] '{scenario_name}' was skipped (see message "
+                  f"above) - no Config A/B data was collected this run.")
     finally:
         # Best-effort cleanup: must NEVER raise past this point, or
         # logger.close()/client.close() below would be skipped (leaking the
@@ -1143,11 +1350,4 @@ def main():
         client.close()
         print(">>> MongoDB client closed.")
 
-
-# ------------------------------------------------------------
-# Entry point
-# ------------------------------------------------------------
-
-if __name__ == "__main__":
-    main()
-
+    return result
