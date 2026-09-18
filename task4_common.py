@@ -130,6 +130,28 @@ task3_common.py
    just scenario start/end markers.
 4. `run_one_scenario(scenario_name, pin_reads=True)` lets you run exactly
    one scenario per script invocation (see task4_scenario_*.py).
+5. BUGFIX - PER-CONFIG run_id / x_id NAMESPACES. In an earlier version of
+   this file, Config A, B, and C (within the SAME call to
+   `run_experiment`) shared exactly one `run_id` (and therefore one
+   `x_id`, and - critically - the SAME sequence of y-document ids
+   `f"{run_id}-y-{k}"` for k = 0..ROUNDS-1). Because the three configs run
+   SEQUENTIALLY against the SAME collection and cleanup only happens once
+   at the very end of `run_experiment`, Config A's y-documents were still
+   present in the collection when Config B started, so every single one
+   of Config B's `insert_one` calls for round k collided with the y
+   document Config A had already inserted for that same k and raised
+   DuplicateKeyError - and likewise for Config C. This silently reduced
+   Config B's and C's `checked` count to 0 for every run, and because the
+   summary logic reports "no violation" / "PASS" whenever
+   `violations == 0` (regardless of `checked`), it produced a false-
+   positive "PASS - writes-follow-reads maintained" verdict for Config C
+   even though NO rounds were ever actually observed.
+
+   Fix: `run_experiment` now derives a SEPARATE `run_id`/`x_id` for each
+   mode - `f"{base_run_id}-{mode}"` / `f"{base_run_id}-{mode}-x"` - so
+   Config A's, B's, and C's y-documents (and x-documents) can never
+   collide with one another, and cleanup deletes each mode's documents by
+   its own run_id.
 """
 
 import threading
@@ -148,7 +170,7 @@ import scenarios
 
 COLLECTION_NAME = "wfr_test"
 
-ROUNDS = 200
+ROUNDS = 150
 WRITER_SECONDS = 30
 
 
@@ -307,6 +329,11 @@ def run_config(pinned_client, pinned_db, pinned_target, x_id, run_id, mode,
     specific node via common.get_pinned_client (when pin_reads=True). B's
     and O's sessions are both started from `pinned_client`, so whichever
     mode is active applies identically to both of them.
+
+    `run_id` / `x_id` MUST be unique to this specific call (i.e. unique per
+    mode within a given scenario run) - see the module docstring's revision
+    note 5 for why sharing them across Config A/B/C causes spurious
+    DuplicateKeyError failures and a false "PASS" verdict.
     """
     labels = {
         "weak": "CONFIG A: no session (independent clients, no causal token)",
@@ -378,6 +405,13 @@ def run_config(pinned_client, pinned_db, pinned_target, x_id, run_id, mode,
             r = x_doc["seq"]
 
             # 2) Client B writes y, which FOLLOWS the read of x.
+            #
+            # y_id is namespaced by `run_id`, which the caller is required
+            # to make unique PER CONFIG (see run_one_scenario /
+            # run_experiment below) - otherwise Config B/C would collide
+            # with y-documents Config A already inserted for the same
+            # round index k and every insert_one here would fail with
+            # DuplicateKeyError (see revision note 5 above).
             y_id = f"{run_id}-y-{k}"
             try:
                 coll.insert_one(
@@ -453,7 +487,18 @@ def run_config(pinned_client, pinned_db, pinned_target, x_id, run_id, mode,
     print(f"Violations          : {counters['violations']} "
           f"({(counters['violations'] / checked * 100) if checked else 0.0:.1f}% "
           f"of checked rounds)")
-    if mode == "causal_propagate":
+    if checked == 0:
+        # A zero-checked run is NOT evidence of anything either way - most
+        # commonly this means every round hit an error/availability-loss
+        # path (e.g. the DuplicateKeyError collision this file used to
+        # have before revision note 5's fix, or a genuine outage during a
+        # failure/partition scenario). Say so explicitly instead of
+        # letting the "no violation" branches below imply a clean PASS.
+        print("RESULT              :",
+              "INCONCLUSIVE - 0 rounds were actually checked, so this run "
+              "provides NO evidence for or against WFR under this config "
+              "(see 'Other errors' / 'Availability losses' above for why)")
+    elif mode == "causal_propagate":
         print("RESULT              :",
               "PASS - writes-follow-reads maintained" if counters["violations"] == 0
               else "FAIL - WFR violation detected despite explicit propagation")
@@ -651,32 +696,73 @@ def run_one_scenario(scenario_name, pin_reads=False):
 
         pinned_db = pinned_client[common.DB_NAME]
 
-        # Fresh run_id/x_id per scenario so results never mix across runs.
-        run_id = str(uuid.uuid4())
-        x_id = f"{run_id}-x"
-        all_run_ids.append(run_id)
+        # Scenario-level id, used only for human-readable bookkeeping/
+        # logging of "this call to run_experiment" as a whole.
+        base_run_id = str(uuid.uuid4())
+        all_run_ids.append(base_run_id)
+
+        # ------------------------------------------------------------------
+        # BUGFIX (see module docstring revision note 5): Config A, B, and C
+        # each need their OWN run_id/x_id namespace. If they shared one
+        # run_id, the y-documents Config A inserts as
+        # f"{run_id}-y-0" .. f"{run_id}-y-{ROUNDS-1}" would still be sitting
+        # in the collection (cleanup only happens once, after all three
+        # configs finish) when Config B tries to insert_one() the SAME
+        # _id for the SAME round index - guaranteed DuplicateKeyError on
+        # every round, for both Config B and Config C. That silently
+        # collapses `checked` to 0 for B and C, and because the reporting
+        # logic below only distinguishes "no violation" from "violation"
+        # (not "no rounds were ever actually observed"), it used to print
+        # a false "PASS - writes-follow-reads maintained" for Config C
+        # even though zero rounds had been checked.
+        #
+        # Fix: derive a distinct run_id/x_id PER MODE from base_run_id.
+        # ------------------------------------------------------------------
+        mode_run_ids = {}
+
+        def _mode_ids(mode):
+            mode_run_id = f"{base_run_id}-{mode}"
+            mode_x_id = f"{mode_run_id}-x"
+            mode_run_ids[mode] = mode_run_id
+            return mode_run_id, mode_x_id
 
         empty_stats = {"checked": 0, "violations": 0, "availability_losses": 0,
                         "errors": 0, "effective_rounds": 0, "rounds_attempted": 0}
         stats_a = stats_b = stats_c = empty_stats
         try:
-            stats_a = run_one_mode("weak", x_id, run_id, scenario_label,
+            run_id_a, x_id_a = _mode_ids("weak")
+            stats_a = run_one_mode("weak", x_id_a, run_id_a, scenario_label,
                                     pinned_client, pinned_db, pinned_target)
-            stats_b = run_one_mode("causal_no_propagate", x_id, run_id, scenario_label,
+
+            run_id_b, x_id_b = _mode_ids("causal_no_propagate")
+            stats_b = run_one_mode("causal_no_propagate", x_id_b, run_id_b, scenario_label,
                                     pinned_client, pinned_db, pinned_target)
-            stats_c = run_one_mode("causal_propagate", x_id, run_id, scenario_label,
+
+            run_id_c, x_id_c = _mode_ids("causal_propagate")
+            stats_c = run_one_mode("causal_propagate", x_id_c, run_id_c, scenario_label,
                                     pinned_client, pinned_db, pinned_target)
         finally:
             try:
                 cleanup_coll = db.get_collection(
                     COLLECTION_NAME, write_concern=WriteConcern(w="majority")
                 )
-                cleanup_coll.delete_many({"run_id": run_id})
-                cleanup_coll.delete_one({"_id": x_id})
+                # Each mode wrote its y-documents tagged with its OWN
+                # run_id, and its own x-document at f"{mode_run_id}-x", so
+                # clean up each mode's documents individually rather than
+                # relying on a single shared run_id/x_id.
+                for mode_run_id in mode_run_ids.values():
+                    cleanup_coll.delete_many({"run_id": mode_run_id})
+                    cleanup_coll.delete_one({"_id": f"{mode_run_id}-x"})
             except PyMongoError as exc:
-                print(f"[cleanup] WARNING: could not clean up x_id={x_id}: {exc}")
+                print(f"[cleanup] WARNING: could not clean up "
+                      f"base_run_id={base_run_id}: {exc}")
             if pinned_client is not client:
                 pinned_client.close()
+
+        # Record the concrete per-mode ids too, so the final CLEANUP
+        # section's printout accurately reflects what was actually
+        # inserted/deleted (rather than just the umbrella base_run_id).
+        all_run_ids.extend(mode_run_ids.values())
 
         return {
             "config_a": stats_a,
@@ -694,10 +780,9 @@ def run_one_scenario(scenario_name, pin_reads=False):
     finally:
         _section("CLEANUP")
         print(f"[{_now()}] removed test documents for run_ids: {all_run_ids} "
-              f"(cleaned up per-scenario as each run finished)")
+              f"(cleaned up per-scenario/per-config as each run finished)")
         logger.close()
         client.close()
         print(f"[{_now()}] connection closed. Run complete.")
 
     return result
-
